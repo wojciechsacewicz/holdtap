@@ -1,0 +1,19 @@
+[package]
+name = "holdtap"
+version = "0.1.1"
+edition = "2024"
+license = "MIT"
+description = "Second-finger tap-to-click filter for Linux multitouch touchpads"
+repository = "https://github.com/wojciechsacewicz/holdtap"
+readme = "README.md"
+keywords = ["linux", "touchpad", "evdev", "uinput", "libinput"]
+categories = ["hardware-support"]
+
+[dependencies]
+evdev = "0.13.2"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
