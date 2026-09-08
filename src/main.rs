@@ -84,11 +84,9 @@ Options:
     );
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct SlotState {
-    tracking_id: Option<i32>,
-    x: Option<i32>,
-    y: Option<i32>,
+    axes: BTreeMap<u16, i32>,
 }
 
 fn main() {
@@ -152,6 +150,7 @@ fn run_device(mut source: Device, config: Config) -> io::Result<()> {
     source.set_nonblocking(true)?;
     eprintln!("holdtap: active (resolution {resolution} units/mm)");
 
+    let mut frame = Vec::new();
     loop {
         wait_readable(&source, POLL_MS)?;
         let now = started.elapsed();
@@ -164,54 +163,55 @@ fn run_device(mut source: Device, config: Config) -> io::Result<()> {
 
         if events.is_empty() {
             if let Decision::RestoreForScroll(slot) = recognizer.tick(now) {
-                restore_contact(&mut output, &recognizer, slot)?;
+                restore_contact(&mut frame, &slots, slot);
+                emit_frame(&mut output, &mut frame, &recognizer)?;
             }
             continue;
         }
 
-        let mut frame = Vec::new();
         for event in events {
             if event.event_type() == EventType::SYNCHRONIZATION && event.code() == 0 {
+                // Evaluate complete coordinates, never a new X paired with an old Y.
+                for (&slot, state) in &slots {
+                    if let (Some(&x), Some(&y)) = (
+                        state.axes.get(&AbsoluteAxisCode::ABS_MT_POSITION_X.0),
+                        state.axes.get(&AbsoluteAxisCode::ABS_MT_POSITION_Y.0),
+                    ) && let Decision::RestoreForScroll(pending) =
+                        recognizer.position(slot, Point { x, y }, now)
+                    {
+                        restore_contact(&mut frame, &slots, pending);
+                    }
+                }
                 emit_frame(&mut output, &mut frame, &recognizer)?;
                 continue;
             }
 
             let mut decision = Decision::Pass;
             if event.event_type() == EventType::ABSOLUTE {
+                if is_mt_attribute(event.code()) {
+                    slots
+                        .entry(current_slot)
+                        .or_default()
+                        .axes
+                        .insert(event.code(), event.value());
+                }
                 match event.code() {
                     code if code == AbsoluteAxisCode::ABS_MT_SLOT.0 => {
                         current_slot = event.value() as u16;
                     }
                     code if code == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 => {
                         if event.value() >= 0 {
-                            slots.entry(current_slot).or_default().tracking_id =
-                                Some(event.value());
                             decision = recognizer.touch_down(current_slot, event.value(), now);
                         } else {
                             decision = recognizer.touch_up(current_slot);
-                            slots.remove(&current_slot);
                         }
                     }
-                    code if code == AbsoluteAxisCode::ABS_MT_POSITION_X.0 => {
-                        slots.entry(current_slot).or_default().x = Some(event.value());
-                    }
-                    code if code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0 => {
-                        slots.entry(current_slot).or_default().y = Some(event.value());
-                    }
                     _ => {}
-                }
-                if let Some(state) = slots.get(&current_slot)
-                    && let (Some(x), Some(y)) = (state.x, state.y)
-                {
-                    let position_decision = recognizer.position(current_slot, Point { x, y }, now);
-                    if !matches!(position_decision, Decision::Pass | Decision::Hide(_)) {
-                        decision = position_decision;
-                    }
                 }
             }
 
             if let Decision::RestoreForScroll(slot) = decision {
-                restore_contact(&mut output, &recognizer, slot)?;
+                restore_contact(&mut frame, &slots, slot);
             }
 
             let pending = recognizer.pending_slot();
@@ -227,7 +227,7 @@ fn run_device(mut source: Device, config: Config) -> io::Result<()> {
                         && (pending == Some(event.value() as u16)
                             || clicked_slot == Some(event.value() as u16))));
             if !hidden_slot_event && !is_tool_count(event) {
-                frame.push(event);
+                queue_event(&mut frame, current_slot, event);
             }
 
             if matches!(decision, Decision::Click(_)) {
@@ -286,39 +286,52 @@ fn wait_readable(device: &Device, timeout_ms: i32) -> io::Result<()> {
     }
 }
 
-fn restore_contact(
-    output: &mut VirtualDevice,
-    recognizer: &Recognizer,
-    slot: u16,
-) -> io::Result<()> {
-    let Some((tracking_id, point)) = recognizer.contact(slot) else {
-        return Ok(());
-    };
-    let mut events = vec![
-        InputEvent::new(
+// Type-B slots retain axis values across frames and contact lifetimes.
+fn is_mt_attribute(code: u16) -> bool {
+    (AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0..=AbsoluteAxisCode::ABS_MT_TOOL_Y.0).contains(&code)
+}
+
+fn queue_event(frame: &mut Vec<InputEvent>, slot: u16, event: InputEvent) {
+    if event.event_type() == EventType::ABSOLUTE && is_mt_attribute(event.code()) {
+        // Filtering and synthetic restoration can change the output slot independently
+        // of the source. Select it explicitly before every forwarded MT attribute.
+        frame.push(InputEvent::new(
             EventType::ABSOLUTE.0,
             AbsoluteAxisCode::ABS_MT_SLOT.0,
             slot.into(),
-        ),
+        ));
+    }
+    frame.push(event);
+}
+
+fn restore_contact(frame: &mut Vec<InputEvent>, slots: &BTreeMap<u16, SlotState>, slot: u16) {
+    let Some(state) = slots.get(&slot) else {
+        return;
+    };
+    let Some(&tracking_id) = state.axes.get(&AbsoluteAxisCode::ABS_MT_TRACKING_ID.0) else {
+        return;
+    };
+    if tracking_id < 0 {
+        return;
+    }
+    queue_event(
+        frame,
+        slot,
         InputEvent::new(
             EventType::ABSOLUTE.0,
             AbsoluteAxisCode::ABS_MT_TRACKING_ID.0,
             tracking_id,
         ),
-    ];
-    if let Some(point) = point {
-        events.push(InputEvent::new(
-            EventType::ABSOLUTE.0,
-            AbsoluteAxisCode::ABS_MT_POSITION_X.0,
-            point.x,
-        ));
-        events.push(InputEvent::new(
-            EventType::ABSOLUTE.0,
-            AbsoluteAxisCode::ABS_MT_POSITION_Y.0,
-            point.y,
-        ));
+    );
+    for (&code, &value) in &state.axes {
+        if code != AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
+            queue_event(
+                frame,
+                slot,
+                InputEvent::new(EventType::ABSOLUTE.0, code, value),
+            );
+        }
     }
-    output.emit(&events)
 }
 
 fn emit_frame(
@@ -349,4 +362,88 @@ fn tool_count_events(count: usize) -> [(u16, i32); 5] {
         (KeyCode::BTN_TOOL_QUADTAP.0, i32::from(count == 4)),
         (KeyCode::BTN_TOOL_QUINTTAP.0, i32::from(count >= 5)),
     ]
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    fn abs(axis: AbsoluteAxisCode, value: i32) -> InputEvent {
+        InputEvent::new(EventType::ABSOLUTE.0, axis.0, value)
+    }
+
+    fn contacts() -> BTreeMap<u16, SlotState> {
+        BTreeMap::from([(
+            1,
+            SlotState {
+                axes: BTreeMap::from([
+                    (AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, 11),
+                    (AbsoluteAxisCode::ABS_MT_POSITION_X.0, 400),
+                    (AbsoluteAxisCode::ABS_MT_POSITION_Y.0, 500),
+                    (AbsoluteAxisCode::ABS_MT_PRESSURE.0, 30),
+                    (AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0, 8),
+                ]),
+            },
+        )])
+    }
+
+    fn replay(events: &[InputEvent]) -> Vec<(i32, u16, i32)> {
+        let mut slot = 0;
+        let mut result = Vec::new();
+        for event in events {
+            if event.event_type() == EventType::ABSOLUTE {
+                if event.code() == AbsoluteAxisCode::ABS_MT_SLOT.0 {
+                    slot = event.value();
+                } else if is_mt_attribute(event.code()) {
+                    result.push((slot, event.code(), event.value()));
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn timeout_restore_does_not_redirect_primary_motion_or_release() {
+        let mut frame = Vec::new();
+        restore_contact(&mut frame, &contacts(), 1);
+        // The physical device still has slot 0 selected and omits ABS_MT_SLOT.
+        queue_event(&mut frame, 0, abs(AbsoluteAxisCode::ABS_MT_POSITION_X, 130));
+        queue_event(&mut frame, 0, abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1));
+        let events = replay(&frame);
+        assert_eq!(
+            &events[events.len() - 2..],
+            &[
+                (0, AbsoluteAxisCode::ABS_MT_POSITION_X.0, 130),
+                (0, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_preserves_buffered_order_and_third_finger_slot() {
+        let mut frame = Vec::new();
+        queue_event(&mut frame, 0, abs(AbsoluteAxisCode::ABS_MT_POSITION_X, 130));
+        restore_contact(&mut frame, &contacts(), 1);
+        queue_event(&mut frame, 2, abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 12));
+        let events = replay(&frame);
+        assert_eq!(
+            events.first(),
+            Some(&(0, AbsoluteAxisCode::ABS_MT_POSITION_X.0, 130))
+        );
+        assert_eq!(
+            events.last(),
+            Some(&(2, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, 12))
+        );
+        assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, 11)));
+    }
+
+    #[test]
+    fn restore_includes_cached_contact_shape_and_pressure() {
+        let mut frame = Vec::new();
+        restore_contact(&mut frame, &contacts(), 1);
+        let events = replay(&frame);
+        assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_PRESSURE.0, 30)));
+        assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0, 8)));
+        assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_POSITION_Y.0, 500)));
+    }
 }

@@ -9,7 +9,6 @@ pub struct Point {
 
 #[derive(Clone, Copy, Debug)]
 struct Contact {
-    tracking_id: i32,
     started: Duration,
     origin: Option<Point>,
     current: Option<Point>,
@@ -76,12 +75,11 @@ impl Recognizer {
         }
     }
 
-    pub fn touch_down(&mut self, slot: u16, tracking_id: i32, now: Duration) -> Decision {
+    pub fn touch_down(&mut self, slot: u16, _tracking_id: i32, now: Duration) -> Decision {
         let active_before = self.contacts.len();
         self.contacts.insert(
             slot,
             Contact {
-                tracking_id,
                 started: now,
                 origin: None,
                 current: None,
@@ -151,12 +149,6 @@ impl Recognizer {
 
     pub fn pending_slot(&self) -> Option<u16> {
         self.pending.map(|(slot, _)| slot)
-    }
-
-    pub fn contact(&self, slot: u16) -> Option<(i32, Option<Point>)> {
-        self.contacts
-            .get(&slot)
-            .map(|contact| (contact.tracking_id, contact.current))
     }
 
     pub fn visible_contacts(&self) -> usize {
