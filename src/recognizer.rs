@@ -151,6 +151,15 @@ impl Recognizer {
         self.pending.map(|(slot, _)| slot)
     }
 
+    pub fn contact_count(&self) -> usize {
+        self.contacts.len()
+    }
+
+    pub fn reset(&mut self) {
+        self.contacts.clear();
+        self.pending = None;
+    }
+
     pub fn visible_contacts(&self) -> usize {
         self.contacts.len() - usize::from(self.pending.is_some())
     }
@@ -220,5 +229,18 @@ mod tests {
         r.touch_down(1, 11, ms(70));
         assert_eq!(r.touch_down(2, 12, ms(75)), Decision::RestoreForScroll(1));
         assert_eq!(r.visible_contacts(), 3);
+    }
+
+    #[test]
+    fn reset_clears_contacts_and_pending_gesture() {
+        let mut r = recognizer();
+        established_primary(&mut r);
+        assert_eq!(r.touch_down(1, 11, ms(70)), Decision::Hide(1));
+
+        r.reset();
+
+        assert_eq!(r.contact_count(), 0);
+        assert_eq!(r.visible_contacts(), 0);
+        assert_eq!(r.pending_slot(), None);
     }
 }

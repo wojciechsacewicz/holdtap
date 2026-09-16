@@ -1,5 +1,5 @@
 pkgname=holdtap
-pkgver=0.1.2
+pkgver=0.1.3
 pkgrel=1
 pkgdesc='Second-finger tap-to-click filter for Linux multitouch touchpads'
 arch=('x86_64')

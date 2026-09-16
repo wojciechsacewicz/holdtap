@@ -210,6 +210,13 @@ fn run_device(mut source: Device, config: Config) -> io::Result<()> {
                 }
             }
 
+            if event.event_type() == EventType::KEY
+                && event.code() == KeyCode::BTN_TOUCH.0
+                && event.value() == 0
+            {
+                reset_after_all_fingers_lifted(&mut frame, &mut slots, &mut recognizer);
+            }
+
             if let Decision::RestoreForScroll(slot) = decision {
                 restore_contact(&mut frame, &slots, slot);
             }
@@ -334,6 +341,45 @@ fn restore_contact(frame: &mut Vec<InputEvent>, slots: &BTreeMap<u16, SlotState>
     }
 }
 
+fn reset_after_all_fingers_lifted(
+    frame: &mut Vec<InputEvent>,
+    slots: &mut BTreeMap<u16, SlotState>,
+    recognizer: &mut Recognizer,
+) {
+    let active_slots: Vec<u16> = slots
+        .iter()
+        .filter_map(|(&slot, state)| {
+            state
+                .axes
+                .get(&AbsoluteAxisCode::ABS_MT_TRACKING_ID.0)
+                .is_some_and(|tracking_id| *tracking_id >= 0)
+                .then_some(slot)
+        })
+        .collect();
+    let stale_contacts = recognizer.contact_count().max(active_slots.len());
+
+    for slot in active_slots {
+        queue_event(
+            frame,
+            slot,
+            InputEvent::new(
+                EventType::ABSOLUTE.0,
+                AbsoluteAxisCode::ABS_MT_TRACKING_ID.0,
+                -1,
+            ),
+        );
+    }
+
+    slots.clear();
+    recognizer.reset();
+
+    if stale_contacts > 0 {
+        eprintln!(
+            "holdtap: resynchronized {stale_contacts} stale contact(s) after all fingers lifted"
+        );
+    }
+}
+
 fn emit_frame(
     output: &mut VirtualDevice,
     frame: &mut Vec<InputEvent>,
@@ -445,5 +491,21 @@ mod stream_tests {
         assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_PRESSURE.0, 30)));
         assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0, 8)));
         assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_POSITION_Y.0, 500)));
+    }
+
+    #[test]
+    fn all_fingers_up_releases_stale_slots_and_resets_recognizer() {
+        let mut frame = Vec::new();
+        let mut slots = contacts();
+        let mut recognizer = Recognizer::new(12, Config::default());
+        recognizer.touch_down(0, 10, Duration::ZERO);
+        recognizer.touch_down(1, 11, Duration::from_millis(10));
+
+        reset_after_all_fingers_lifted(&mut frame, &mut slots, &mut recognizer);
+
+        assert!(replay(&frame).contains(&(1, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1)));
+        assert!(slots.is_empty());
+        assert_eq!(recognizer.contact_count(), 0);
+        assert_eq!(recognizer.pending_slot(), None);
     }
 }
