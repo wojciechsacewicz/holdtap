@@ -49,8 +49,8 @@ fn eventually<T>(mut read: impl FnMut() -> Option<T>, message: &str) -> T {
     }
 }
 
-fn kernel_contacts(device: &Device) -> io::Result<([i32; 2], bool)> {
-    let mut slots = [Axis::ABS_MT_TRACKING_ID.0 as i32, -1, -1];
+fn kernel_axis(device: &Device, axis: Axis) -> io::Result<[i32; 2]> {
+    let mut slots = [axis.0 as i32, -1, -1];
     let request = (2_u64 << 30)
         | ((std::mem::size_of_val(&slots) as u64) << 16)
         | (u64::from(b'E') << 8)
@@ -65,10 +65,15 @@ fn kernel_contacts(device: &Device) -> io::Result<([i32; 2], bool)> {
     {
         return Err(io::Error::last_os_error());
     }
-    let keys = device.get_key_state()?;
+    Ok([slots[1], slots[2]])
+}
+
+fn kernel_contacts(device: &Device) -> io::Result<([i32; 2], bool)> {
     Ok((
-        [slots[1], slots[2]],
-        keys.contains(KeyCode::BTN_TOOL_DOUBLETAP),
+        kernel_axis(device, Axis::ABS_MT_TRACKING_ID)?,
+        device
+            .get_key_state()?
+            .contains(KeyCode::BTN_TOOL_DOUBLETAP),
     ))
 }
 
@@ -86,10 +91,7 @@ fn assert_contacts(device: &Device, expected: [i32; 2], double: bool, stage: &st
     );
 }
 
-#[test]
-#[ignore = "requires /dev/uinput and evdev access; uses synthetic devices only"]
-fn recovers_multitouch_slots_after_kernel_queue_overflow() -> io::Result<()> {
-    let name = format!("holdtap queue regression {}", std::process::id());
+fn synthetic_source(name: &str) -> io::Result<VirtualDevice> {
     let mut keys = AttributeSet::new();
     for key in [
         KeyCode::BTN_LEFT,
@@ -103,19 +105,32 @@ fn recovers_multitouch_slots_after_kernel_queue_overflow() -> io::Result<()> {
         keys.insert(key);
     }
     // No POINTER property: neither synthetic device participates in desktop gestures.
-    let mut builder = VirtualDevice::builder()?.name(&name).with_keys(&keys)?;
+    let mut builder = VirtualDevice::builder()?.name(name).with_keys(&keys)?;
     for (axis, max) in [
         (Axis::ABS_MT_SLOT, 1),
         (Axis::ABS_MT_TRACKING_ID, 65535),
         (Axis::ABS_MT_POSITION_X, 10000),
         (Axis::ABS_MT_POSITION_Y, 10000),
+        (Axis::ABS_MT_PRESSURE, 255),
+        (Axis::ABS_MT_TOUCH_MAJOR, 255),
     ] {
         builder = builder.with_absolute_axis(&UinputAbsSetup::new(
             axis,
             AbsInfo::new(0, 0, max, 0, 0, 12),
         ))?;
     }
-    let mut source = builder.build()?;
+    builder.build()
+}
+
+fn test_binary() -> std::ffi::OsString {
+    std::env::var_os("HOLDTAP_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_holdtap").into())
+}
+
+#[test]
+#[ignore = "requires /dev/uinput and evdev access; uses synthetic devices only"]
+fn recovers_multitouch_slots_after_kernel_queue_overflow() -> io::Result<()> {
+    let name = format!("holdtap queue regression {}", std::process::id());
+    let mut source = synthetic_source(&name)?;
     let path = source
         .enumerate_dev_nodes_blocking()?
         .next()
@@ -148,7 +163,7 @@ fn recovers_multitouch_slots_after_kernel_queue_overflow() -> io::Result<()> {
     drop(overflow_observer);
     source.emit(&[abs(Axis::ABS_MT_POSITION_X, 100)])?;
     let mut child = RunningHoldtap(
-        Command::new(env!("CARGO_BIN_EXE_holdtap"))
+        Command::new(test_binary())
             .arg("--device")
             .arg(path)
             .spawn()?,
@@ -204,5 +219,105 @@ fn recovers_multitouch_slots_after_kernel_queue_overflow() -> io::Result<()> {
     ])?;
     assert_contacts(&output, [20, 21], true, "next two-finger gesture");
     assert!(child.0.try_wait()?.is_none(), "HoldTap exited unexpectedly");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires /dev/uinput and evdev access; uses synthetic devices only"]
+fn restores_unchanged_slot_attributes_after_all_fingers_lift() -> io::Result<()> {
+    let name = format!("holdtap slot cache regression {}", std::process::id());
+    let mut source = synthetic_source(&name)?;
+    let path = source
+        .enumerate_dev_nodes_blocking()?
+        .next()
+        .expect("synthetic evdev node")?;
+    let _child = RunningHoldtap(
+        Command::new(test_binary())
+            .arg("--device")
+            .arg(path)
+            .args(["--primary-age-ms", "0", "--primary-move-mm", "0"])
+            .spawn()?,
+    );
+    let output_name = format!("{name} (holdtap)");
+    let output = eventually(
+        || {
+            evdev::enumerate().find_map(|(_, device)| {
+                (device.name() == Some(output_name.as_str())).then_some(device)
+            })
+        },
+        "HoldTap output device did not appear",
+    );
+    thread::sleep(Duration::from_millis(100));
+    source.emit(&contact(0, 10, 100))?;
+    source.emit(&[key(KeyCode::BTN_TOUCH, 1), key(KeyCode::BTN_TOOL_FINGER, 1)])?;
+    assert_contacts(&output, [10, -1], false, "initial primary");
+    source.emit(&[
+        abs(Axis::ABS_MT_POSITION_X, 125),
+        abs(Axis::ABS_MT_POSITION_Y, 301),
+    ])?;
+    thread::sleep(Duration::from_millis(30));
+    source.emit(&[
+        abs(Axis::ABS_MT_SLOT, 1),
+        abs(Axis::ABS_MT_TRACKING_ID, 11),
+        abs(Axis::ABS_MT_POSITION_X, 500),
+        abs(Axis::ABS_MT_POSITION_Y, 600),
+        abs(Axis::ABS_MT_PRESSURE, 30),
+        abs(Axis::ABS_MT_TOUCH_MAJOR, 8),
+        key(KeyCode::BTN_TOOL_FINGER, 0),
+        key(KeyCode::BTN_TOOL_DOUBLETAP, 1),
+    ])?;
+    thread::sleep(Duration::from_millis(30));
+    assert_contacts(
+        &output,
+        [10, -1],
+        false,
+        "quick second contact remains hidden",
+    );
+    source.emit(&[
+        abs(Axis::ABS_MT_TRACKING_ID, -1),
+        key(KeyCode::BTN_TOOL_DOUBLETAP, 0),
+        key(KeyCode::BTN_TOOL_FINGER, 1),
+    ])?;
+    thread::sleep(Duration::from_millis(30));
+    source.emit(&[
+        abs(Axis::ABS_MT_SLOT, 0),
+        abs(Axis::ABS_MT_TRACKING_ID, -1),
+        key(KeyCode::BTN_TOUCH, 0),
+        key(KeyCode::BTN_TOOL_FINGER, 0),
+    ])?;
+    assert_contacts(&output, [-1, -1], false, "all fingers lifted");
+
+    source.emit(&contact(0, 20, 100))?;
+    source.emit(&[key(KeyCode::BTN_TOUCH, 1), key(KeyCode::BTN_TOOL_FINGER, 1)])?;
+    assert_contacts(&output, [20, -1], false, "next primary");
+    source.emit(&[
+        abs(Axis::ABS_MT_POSITION_X, 125),
+        abs(Axis::ABS_MT_POSITION_Y, 301),
+    ])?;
+    thread::sleep(Duration::from_millis(30));
+    // Type-B devices omit unchanged values even when a slot starts a new contact.
+    source.emit(&[
+        abs(Axis::ABS_MT_SLOT, 1),
+        abs(Axis::ABS_MT_TRACKING_ID, 21),
+        abs(Axis::ABS_MT_POSITION_X, 520),
+        key(KeyCode::BTN_TOOL_FINGER, 0),
+        key(KeyCode::BTN_TOOL_DOUBLETAP, 1),
+    ])?;
+    assert_contacts(&output, [20, 21], true, "timeout restores second contact");
+    assert_eq!(
+        kernel_axis(&output, Axis::ABS_MT_POSITION_Y)?[1],
+        600,
+        "restored slot Y"
+    );
+    assert_eq!(
+        kernel_axis(&output, Axis::ABS_MT_PRESSURE)?[1],
+        30,
+        "restored slot pressure"
+    );
+    assert_eq!(
+        kernel_axis(&output, Axis::ABS_MT_TOUCH_MAJOR)?[1],
+        8,
+        "restored slot touch major"
+    );
     Ok(())
 }

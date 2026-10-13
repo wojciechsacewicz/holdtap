@@ -160,6 +160,25 @@ impl Recognizer {
         self.pending = None;
     }
 
+    pub fn resynchronize(
+        &mut self,
+        contacts: impl IntoIterator<Item = (u16, Point)>,
+        now: Duration,
+    ) {
+        self.reset();
+        self.contacts
+            .extend(contacts.into_iter().map(|(slot, point)| {
+                (
+                    slot,
+                    Contact {
+                        started: now,
+                        origin: Some(point),
+                        current: Some(point),
+                    },
+                )
+            }));
+    }
+
     pub fn visible_contacts(&self) -> usize {
         self.contacts.len() - usize::from(self.pending.is_some())
     }
@@ -181,6 +200,29 @@ mod tests {
 
     fn recognizer() -> Recognizer {
         Recognizer::new(12, Config::default())
+    }
+
+    #[test]
+    fn resynchronize_imports_visible_contacts_without_a_pending_tap() {
+        let mut r = Recognizer::new(
+            12,
+            Config {
+                min_primary_age: Duration::ZERO,
+                primary_move_mm: 0.0,
+                ..Config::default()
+            },
+        );
+        r.touch_down(0, 10, ms(0));
+        assert_eq!(r.touch_down(1, 11, ms(1)), Decision::Hide(1));
+
+        r.resynchronize(
+            [(0, Point { x: 100, y: 200 }), (1, Point { x: 300, y: 400 })],
+            ms(10),
+        );
+
+        assert_eq!(r.visible_contacts(), 2);
+        assert_eq!(r.pending_slot(), None);
+        assert_eq!(r.touch_up(1), Decision::Pass);
     }
 
     #[test]

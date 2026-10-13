@@ -1,7 +1,11 @@
 mod recognizer;
 
+use evdev::raw_stream::RawDevice;
 use evdev::uinput::VirtualDevice;
-use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, KeyCode, PropType, UinputAbsSetup};
+use evdev::{
+    AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode, PropType, SynchronizationCode,
+    UinputAbsSetup,
+};
 use recognizer::{Config, Decision, Point, Recognizer};
 use std::collections::BTreeMap;
 use std::io;
@@ -11,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_MS: i32 = 10;
+const MAX_RECOVERY_BATCHES: usize = 32;
 
 #[derive(Debug)]
 struct Options {
@@ -89,6 +94,26 @@ struct SlotState {
     axes: BTreeMap<u16, i32>,
 }
 
+struct SlotLayout {
+    count: u16,
+    axes: Vec<AbsoluteAxisCode>,
+    keys: Vec<KeyCode>,
+}
+
+struct SourceSnapshot {
+    current_slot: u16,
+    slots: BTreeMap<u16, SlotState>,
+    keys: AttributeSet<KeyCode>,
+    other_axes: Vec<(AbsoluteAxisCode, i32)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    Forwarding,
+    DiscardUntilReport,
+    SnapshotPending,
+}
+
 fn main() {
     let options = Options::parse().unwrap_or_else(|error| {
         eprintln!("holdtap: {error}\nTry --help for usage.");
@@ -108,8 +133,8 @@ fn main() {
     }
 }
 
-fn find_device(requested: Option<&str>) -> Option<(PathBuf, Device)> {
-    evdev::enumerate().find(|(path, device)| {
+fn find_device(requested: Option<&str>) -> Option<(PathBuf, RawDevice)> {
+    evdev::raw_stream::enumerate().find(|(path, device)| {
         if device
             .name()
             .is_some_and(|name| name.ends_with(" (holdtap)"))
@@ -123,7 +148,7 @@ fn find_device(requested: Option<&str>) -> Option<(PathBuf, Device)> {
     })
 }
 
-fn is_touchpad(device: &Device) -> bool {
+fn is_touchpad(device: &RawDevice) -> bool {
     let axes = device.supported_absolute_axes();
     device.properties().contains(PropType::POINTER)
         && !device.properties().contains(PropType::DIRECT)
@@ -135,8 +160,9 @@ fn is_touchpad(device: &Device) -> bool {
         })
 }
 
-fn run_device(mut source: Device, config: Config) -> io::Result<()> {
+fn run_device(mut source: RawDevice, config: Config) -> io::Result<()> {
     let mut output = clone_device(&source)?;
+    let layout = slot_layout(&source)?;
     let resolution = source
         .get_absinfo()?
         .find(|(axis, _)| *axis == AbsoluteAxisCode::ABS_MT_POSITION_X)
@@ -144,10 +170,12 @@ fn run_device(mut source: Device, config: Config) -> io::Result<()> {
     let mut recognizer = Recognizer::new(resolution, config);
     let mut slots = BTreeMap::<u16, SlotState>::new();
     let mut current_slot = 0_u16;
+    let mut recovery = Recovery::SnapshotPending;
+    let mut dropped = false;
     let started = Instant::now();
 
     source.grab()?;
-    source.set_nonblocking(true)?;
+    set_nonblocking(&source)?;
     eprintln!("holdtap: active (resolution {resolution} units/mm)");
 
     let mut frame = Vec::new();
@@ -159,6 +187,63 @@ fn run_device(mut source: Device, config: Config) -> io::Result<()> {
             Ok(batch) => events.extend(batch),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
+        }
+
+        if let Some(index) = events.iter().position(|event| {
+            event.event_type() == EventType::SYNCHRONIZATION
+                && event.code() == SynchronizationCode::SYN_DROPPED.0
+        }) {
+            frame.clear();
+            recognizer.reset();
+            release_output(&mut output, &layout, &recognizer)?;
+            recovery = Recovery::DiscardUntilReport;
+            discard_events(&events[index..], &mut recovery);
+            events.clear();
+            if !dropped {
+                eprintln!("holdtap: input events dropped; resynchronizing multitouch state");
+            }
+            dropped = true;
+        }
+
+        if recovery != Recovery::Forwarding {
+            discard_events(&events, &mut recovery);
+            if !drain_source(&mut source, &mut recovery)? {
+                continue;
+            }
+            let snapshot = snapshot_source(&source, &layout)?;
+            // Separate axis ioctls can span a physical frame. Retry if input arrived.
+            match source.fetch_events() {
+                Ok(batch) => {
+                    let tail: Vec<_> = batch.collect();
+                    if !tail.is_empty() {
+                        discard_events(&tail, &mut recovery);
+                        continue;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            frame.clear();
+            recognizer.reset();
+            release_output(&mut output, &layout, &recognizer)?;
+            install_snapshot(
+                &mut frame,
+                &mut recognizer,
+                &mut slots,
+                &mut current_slot,
+                snapshot,
+                now,
+            );
+            emit_frame(&mut output, &mut frame, &recognizer)?;
+            recovery = Recovery::Forwarding;
+            if dropped {
+                eprintln!(
+                    "holdtap: restored {} contact(s) after input loss",
+                    recognizer.contact_count()
+                );
+                dropped = false;
+            }
+            continue;
         }
 
         if events.is_empty() {
@@ -246,7 +331,7 @@ fn run_device(mut source: Device, config: Config) -> io::Result<()> {
     }
 }
 
-fn clone_device(source: &Device) -> io::Result<VirtualDevice> {
+fn clone_device(source: &RawDevice) -> io::Result<VirtualDevice> {
     let name = format!("{} (holdtap)", source.name().unwrap_or("Touchpad"));
     let mut builder = VirtualDevice::builder()
         .map_err(|error| context("open /dev/uinput", error))?
@@ -279,7 +364,208 @@ fn context(operation: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
-fn wait_readable(device: &Device, timeout_ms: i32) -> io::Result<()> {
+fn set_nonblocking(source: &RawDevice) -> io::Result<()> {
+    let fd = source.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn slot_layout(source: &RawDevice) -> io::Result<SlotLayout> {
+    let info = source
+        .get_absinfo()?
+        .find(|(axis, _)| *axis == AbsoluteAxisCode::ABS_MT_SLOT)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing multitouch slots"))?
+        .1;
+    // EVIOCGMTSLOTS encodes its buffer length in a 14-bit ioctl size field.
+    if info.minimum() != 0 || !(0..4094).contains(&info.maximum()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid multitouch slot range",
+        ));
+    }
+    Ok(SlotLayout {
+        count: (info.maximum() + 1) as u16,
+        axes: source
+            .supported_absolute_axes()
+            .into_iter()
+            .flat_map(|axes| axes.iter())
+            .filter(|axis| is_mt_attribute(axis.0))
+            .collect(),
+        keys: source
+            .supported_keys()
+            .into_iter()
+            .flat_map(|keys| keys.iter())
+            .collect(),
+    })
+}
+
+fn snapshot_source(source: &RawDevice, layout: &SlotLayout) -> io::Result<SourceSnapshot> {
+    let absolute = source.get_abs_state()?;
+    let current_slot = absolute[usize::from(AbsoluteAxisCode::ABS_MT_SLOT.0)].value;
+    if !(0..i32::from(layout.count)).contains(&current_slot) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid selected multitouch slot",
+        ));
+    }
+    let mut slots: BTreeMap<_, _> = (0..layout.count)
+        .map(|slot| (slot, SlotState::default()))
+        .collect();
+    for axis in &layout.axes {
+        let mut values = vec![0_i32; usize::from(layout.count) + 1];
+        values[0] = i32::from(axis.0);
+        let additional_bytes = usize::from(layout.count) * std::mem::size_of::<i32>();
+        let request =
+            libc::_IOR::<i32>(u32::from(b'E'), 0x0a) + ((additional_bytes as libc::c_ulong) << 16);
+        // The first i32 is the axis selector, followed by one i32 per kernel slot.
+        if unsafe { libc::ioctl(source.as_raw_fd(), request, values.as_mut_ptr()) } < 0 {
+            return Err(context(
+                &format!("read multitouch axis 0x{:x}", axis.0),
+                io::Error::last_os_error(),
+            ));
+        }
+        for (state, value) in slots.values_mut().zip(values.into_iter().skip(1)) {
+            state.axes.insert(axis.0, value);
+        }
+    }
+    Ok(SourceSnapshot {
+        current_slot: current_slot as u16,
+        slots,
+        keys: source.get_key_state()?,
+        other_axes: source
+            .supported_absolute_axes()
+            .into_iter()
+            .flat_map(|axes| axes.iter())
+            .filter(|axis| *axis != AbsoluteAxisCode::ABS_MT_SLOT && !is_mt_attribute(axis.0))
+            .map(|axis| (axis, absolute[usize::from(axis.0)].value))
+            .collect(),
+    })
+}
+
+fn discard_events(events: &[InputEvent], recovery: &mut Recovery) {
+    for event in events {
+        *recovery = if event.event_type() == EventType::SYNCHRONIZATION
+            && event.code() == SynchronizationCode::SYN_REPORT.0
+        {
+            Recovery::SnapshotPending
+        } else {
+            Recovery::DiscardUntilReport
+        };
+    }
+}
+
+fn drain_source(source: &mut RawDevice, recovery: &mut Recovery) -> io::Result<bool> {
+    for _ in 0..MAX_RECOVERY_BATCHES {
+        match source.fetch_events() {
+            Ok(batch) => {
+                let events: Vec<_> = batch.collect();
+                if events.is_empty() {
+                    return Ok(*recovery == Recovery::SnapshotPending);
+                }
+                discard_events(&events, recovery);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(*recovery == Recovery::SnapshotPending);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn release_output(
+    output: &mut VirtualDevice,
+    layout: &SlotLayout,
+    recognizer: &Recognizer,
+) -> io::Result<()> {
+    let mut frame = vec![InputEvent::new(EventType::KEY.0, KeyCode::BTN_TOUCH.0, 0)];
+    for slot in 0..layout.count {
+        queue_event(
+            &mut frame,
+            slot,
+            InputEvent::new(
+                EventType::ABSOLUTE.0,
+                AbsoluteAxisCode::ABS_MT_TRACKING_ID.0,
+                -1,
+            ),
+        );
+    }
+    for key in &layout.keys {
+        if *key != KeyCode::BTN_TOUCH {
+            frame.push(InputEvent::new(EventType::KEY.0, key.0, 0));
+        }
+    }
+    emit_frame(output, &mut frame, recognizer)
+}
+
+fn install_snapshot(
+    frame: &mut Vec<InputEvent>,
+    recognizer: &mut Recognizer,
+    slots: &mut BTreeMap<u16, SlotState>,
+    current_slot: &mut u16,
+    snapshot: SourceSnapshot,
+    now: Duration,
+) {
+    *current_slot = snapshot.current_slot;
+    *slots = snapshot.slots;
+    recognizer.resynchronize(
+        slots.iter().filter_map(|(&slot, state)| {
+            let tracking_id = *state.axes.get(&AbsoluteAxisCode::ABS_MT_TRACKING_ID.0)?;
+            if tracking_id < 0 {
+                return None;
+            }
+            Some((
+                slot,
+                Point {
+                    x: *state.axes.get(&AbsoluteAxisCode::ABS_MT_POSITION_X.0)?,
+                    y: *state.axes.get(&AbsoluteAxisCode::ABS_MT_POSITION_Y.0)?,
+                },
+            ))
+        }),
+        now,
+    );
+    frame.push(InputEvent::new(
+        EventType::KEY.0,
+        KeyCode::BTN_TOUCH.0,
+        i32::from(snapshot.keys.contains(KeyCode::BTN_TOUCH)),
+    ));
+    for (&slot, state) in slots.iter() {
+        if let Some(&tracking_id) = state.axes.get(&AbsoluteAxisCode::ABS_MT_TRACKING_ID.0) {
+            queue_event(
+                frame,
+                slot,
+                InputEvent::new(
+                    EventType::ABSOLUTE.0,
+                    AbsoluteAxisCode::ABS_MT_TRACKING_ID.0,
+                    tracking_id,
+                ),
+            );
+        }
+        for (&code, &value) in &state.axes {
+            if code != AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
+                queue_event(
+                    frame,
+                    slot,
+                    InputEvent::new(EventType::ABSOLUTE.0, code, value),
+                );
+            }
+        }
+    }
+    for (axis, value) in snapshot.other_axes {
+        frame.push(InputEvent::new(EventType::ABSOLUTE.0, axis.0, value));
+    }
+    for key in snapshot.keys.iter() {
+        let event = InputEvent::new(EventType::KEY.0, key.0, 1);
+        if key != KeyCode::BTN_TOUCH && !is_tool_count(event) {
+            frame.push(event);
+        }
+    }
+}
+
+fn wait_readable(device: &RawDevice, timeout_ms: i32) -> io::Result<()> {
     let mut descriptor = libc::pollfd {
         fd: device.as_raw_fd(),
         events: libc::POLLIN,
@@ -346,19 +632,18 @@ fn reset_after_all_fingers_lifted(
     slots: &mut BTreeMap<u16, SlotState>,
     recognizer: &mut Recognizer,
 ) {
-    let active_slots: Vec<u16> = slots
-        .iter()
-        .filter_map(|(&slot, state)| {
+    let active_slots = slots
+        .values()
+        .filter(|state| {
             state
                 .axes
                 .get(&AbsoluteAxisCode::ABS_MT_TRACKING_ID.0)
                 .is_some_and(|tracking_id| *tracking_id >= 0)
-                .then_some(slot)
         })
-        .collect();
-    let stale_contacts = recognizer.contact_count().max(active_slots.len());
+        .count();
+    let stale_contacts = recognizer.contact_count().max(active_slots);
 
-    for slot in active_slots {
+    for (&slot, state) in slots.iter_mut() {
         queue_event(
             frame,
             slot,
@@ -368,9 +653,11 @@ fn reset_after_all_fingers_lifted(
                 -1,
             ),
         );
+        state
+            .axes
+            .insert(AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1);
     }
 
-    slots.clear();
     recognizer.reset();
 
     if stale_contacts > 0 {
@@ -504,8 +791,12 @@ mod stream_tests {
         frame.clear();
 
         let state = slots.entry(1).or_default();
-        state.axes.insert(AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, 12);
-        state.axes.insert(AbsoluteAxisCode::ABS_MT_POSITION_X.0, 420);
+        state
+            .axes
+            .insert(AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, 12);
+        state
+            .axes
+            .insert(AbsoluteAxisCode::ABS_MT_POSITION_X.0, 420);
         restore_contact(&mut frame, &slots, 1);
 
         let events = replay(&frame);
@@ -518,6 +809,12 @@ mod stream_tests {
     fn all_fingers_up_releases_stale_slots_and_resets_recognizer() {
         let mut frame = Vec::new();
         let mut slots = contacts();
+        slots.insert(
+            2,
+            SlotState {
+                axes: BTreeMap::from([(AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1)]),
+            },
+        );
         let mut recognizer = Recognizer::new(12, Config::default());
         recognizer.touch_down(0, 10, Duration::ZERO);
         recognizer.touch_down(1, 11, Duration::from_millis(10));
@@ -525,7 +822,9 @@ mod stream_tests {
         reset_after_all_fingers_lifted(&mut frame, &mut slots, &mut recognizer);
 
         assert!(replay(&frame).contains(&(1, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1)));
-        assert!(slots.is_empty());
+        assert!(replay(&frame).contains(&(2, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1)));
+        assert_eq!(slots[&1].axes[&AbsoluteAxisCode::ABS_MT_TRACKING_ID.0], -1);
+        assert_eq!(slots[&1].axes[&AbsoluteAxisCode::ABS_MT_POSITION_Y.0], 500);
         assert_eq!(recognizer.contact_count(), 0);
         assert_eq!(recognizer.pending_slot(), None);
     }

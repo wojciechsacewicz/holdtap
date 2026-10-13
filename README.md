@@ -99,6 +99,12 @@ When the first finger is already moving the pointer, the daemon briefly hides a
 new second contact. A quick release emits `BTN_LEFT`. Movement, a timeout, or an
 extra finger restores the hidden contact and lets libinput handle the gesture.
 
+If the kernel drops input events, HoldTap releases the virtual contacts and
+rebuilds them from the touchpad's current per-slot state. This clears lost or
+stuck fingers without restarting the service or recreating the virtual device.
+Recovery messages appear in `journalctl -u holdtap.service`; touch coordinates
+and input events are not logged.
+
 The kernel releases the device grab if the daemon stops or crashes. Your
 touchpad then returns to its normal behavior.
 
@@ -136,6 +142,13 @@ input events.
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
+```
+
+Kernel integration tests create synthetic input devices that do not control the
+desktop pointer. They need access to `/dev/uinput` and `/dev/input/event*`:
+
+```bash
+cargo test --locked --test kernel_recovery -- --ignored --test-threads=1
 ```
 
 ## License
