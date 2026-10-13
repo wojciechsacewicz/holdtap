@@ -2,13 +2,16 @@
 
 <sub>HOLDTAP · FOR LINUX TOUCHPADS</sub>
 
-# Keep your finger down.
+# HoldTap: second-finger tap-to-click for Linux touchpads
 
 **Move with one finger. Tap with another. Click without breaking your flow.**
 
-HoldTap adds one small gesture that many touchpads are missing.
+HoldTap brings MacBook-inspired clicking to Linux touchpads and trackpads. Keep
+one finger down to move the pointer, then tap with another to click. It works
+below libinput on Wayland and X11, preserving normal scrolling and multitouch
+gestures.
 
-[How it feels](#the-gesture) · [Install](#install) · [Tune](#tune-the-gesture) · [How it works](#how-it-works)
+[How it feels](#the-gesture) · [Install](#install) · [Tune](#tune-the-gesture) · [How it works](#how-it-works) · [Roadmap](#roadmap)
 
 </div>
 
@@ -117,6 +120,21 @@ touchpad then returns to its normal behavior.
 
 The project is young and hardware varies. If automatic detection selects the
 wrong device, pass its event path or exact name with `--device`.
+
+## Roadmap
+
+Ideas for more MacBook-style touchpad gestures live in
+[Missing MacBook Force Touch trackpad features](https://github.com/wojciechsacewicz/holdtap/issues/1):
+
+- Drag without lifting the pointer finger.
+- Optional three-finger drag.
+- Two-finger double-tap for smart zoom, with app integration.
+
+These are proposed features, not current capabilities. Force click and haptic
+feedback would also need suitable hardware.
+
+Leave a reaction or comment on the issue to say what you'd use, or make a PR! :)
+If HoldTap helps you, a GitHub star is appreciated.
 
 ## Stop or remove
 
