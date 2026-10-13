@@ -494,6 +494,27 @@ mod stream_tests {
     }
 
     #[test]
+    fn all_fingers_up_preserves_axes_for_next_hidden_contact() {
+        let mut frame = Vec::new();
+        let mut slots = contacts();
+        let mut recognizer = Recognizer::new(12, Config::default());
+        recognizer.touch_down(1, 11, Duration::ZERO);
+
+        reset_after_all_fingers_lifted(&mut frame, &mut slots, &mut recognizer);
+        frame.clear();
+
+        let state = slots.entry(1).or_default();
+        state.axes.insert(AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, 12);
+        state.axes.insert(AbsoluteAxisCode::ABS_MT_POSITION_X.0, 420);
+        restore_contact(&mut frame, &slots, 1);
+
+        let events = replay(&frame);
+        assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_POSITION_Y.0, 500)));
+        assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_PRESSURE.0, 30)));
+        assert!(events.contains(&(1, AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR.0, 8)));
+    }
+
+    #[test]
     fn all_fingers_up_releases_stale_slots_and_resets_recognizer() {
         let mut frame = Vec::new();
         let mut slots = contacts();
