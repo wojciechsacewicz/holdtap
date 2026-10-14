@@ -113,6 +113,7 @@ fn synthetic_source(name: &str) -> io::Result<VirtualDevice> {
         (Axis::ABS_MT_POSITION_Y, 10000),
         (Axis::ABS_MT_PRESSURE, 255),
         (Axis::ABS_MT_TOUCH_MAJOR, 255),
+        (Axis::ABS_MT_TOOL_TYPE, 2),
     ] {
         builder = builder.with_absolute_axis(&UinputAbsSetup::new(
             axis,
@@ -318,6 +319,122 @@ fn restores_unchanged_slot_attributes_after_all_fingers_lift() -> io::Result<()>
         kernel_axis(&output, Axis::ABS_MT_TOUCH_MAJOR)?[1],
         8,
         "restored slot touch major"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires /dev/uinput and evdev access; uses synthetic devices only"]
+fn clears_stale_palm_type_when_a_hidden_slot_becomes_visible() -> io::Result<()> {
+    let name = format!("holdtap palm regression {}", std::process::id());
+    let mut source = synthetic_source(&name)?;
+    let path = source
+        .enumerate_dev_nodes_blocking()?
+        .next()
+        .expect("synthetic evdev node")?;
+    let physical = eventually(
+        || Device::open(&path).ok(),
+        "synthetic source node did not become accessible",
+    );
+    let _child = RunningHoldtap(
+        Command::new(test_binary())
+            .arg("--device")
+            .arg(path)
+            .args(["--primary-age-ms", "0", "--primary-move-mm", "0"])
+            .spawn()?,
+    );
+    let output_name = format!("{name} (holdtap)");
+    let output = eventually(
+        || {
+            evdev::enumerate().find_map(|(_, device)| {
+                (device.name() == Some(output_name.as_str())).then_some(device)
+            })
+        },
+        "HoldTap output device did not appear",
+    );
+    thread::sleep(Duration::from_millis(100));
+
+    source.emit(&contact(1, 10, 500))?;
+    source.emit(&[
+        abs(Axis::ABS_MT_TOOL_TYPE, 2),
+        key(KeyCode::BTN_TOUCH, 1),
+        key(KeyCode::BTN_TOOL_FINGER, 1),
+    ])?;
+    assert_contacts(&output, [-1, 10], false, "initial visible palm contact");
+    eventually(
+        || (kernel_axis(&output, Axis::ABS_MT_TOOL_TYPE).ok()?[1] == 2).then_some(()),
+        "initial virtual palm type was not forwarded",
+    );
+    source.emit(&[
+        abs(Axis::ABS_MT_TRACKING_ID, -1),
+        key(KeyCode::BTN_TOUCH, 0),
+        key(KeyCode::BTN_TOOL_FINGER, 0),
+    ])?;
+    assert_contacts(&output, [-1, -1], false, "initial palm lifted");
+
+    source.emit(&contact(0, 20, 100))?;
+    source.emit(&[key(KeyCode::BTN_TOUCH, 1), key(KeyCode::BTN_TOOL_FINGER, 1)])?;
+    assert_contacts(&output, [20, -1], false, "moving primary contact");
+    source.emit(&[
+        abs(Axis::ABS_MT_POSITION_X, 125),
+        abs(Axis::ABS_MT_POSITION_Y, 301),
+    ])?;
+    thread::sleep(Duration::from_millis(30));
+    source.emit(&contact(1, 21, 520))?;
+    source.emit(&[
+        abs(Axis::ABS_MT_TOOL_TYPE, 0),
+        key(KeyCode::BTN_TOOL_FINGER, 0),
+        key(KeyCode::BTN_TOOL_DOUBLETAP, 1),
+    ])?;
+    thread::sleep(Duration::from_millis(30));
+    assert_contacts(
+        &output,
+        [20, -1],
+        false,
+        "finger type change belongs to hidden contact",
+    );
+    source.emit(&[
+        abs(Axis::ABS_MT_TRACKING_ID, -1),
+        key(KeyCode::BTN_TOOL_DOUBLETAP, 0),
+        key(KeyCode::BTN_TOOL_FINGER, 1),
+    ])?;
+    thread::sleep(Duration::from_millis(30));
+    source.emit(&[
+        abs(Axis::ABS_MT_SLOT, 0),
+        abs(Axis::ABS_MT_TRACKING_ID, -1),
+        key(KeyCode::BTN_TOUCH, 0),
+        key(KeyCode::BTN_TOOL_FINGER, 0),
+    ])?;
+    assert_contacts(
+        &output,
+        [-1, -1],
+        false,
+        "hidden click followed by all fingers lifted",
+    );
+    assert_eq!(
+        kernel_axis(&physical, Axis::ABS_MT_TOOL_TYPE)?[1],
+        0,
+        "physical slot is a finger"
+    );
+    assert_eq!(
+        kernel_axis(&output, Axis::ABS_MT_TOOL_TYPE)?[1],
+        2,
+        "inactive virtual slot still remembers palm"
+    );
+
+    // The kernel omits TOOL_TYPE=0 because the physical slot already stores that value.
+    source.emit(&contact(1, 30, 540))?;
+    source.emit(&[key(KeyCode::BTN_TOUCH, 1), key(KeyCode::BTN_TOOL_FINGER, 1)])?;
+    assert_contacts(
+        &output,
+        [-1, 30],
+        false,
+        "previously hidden slot becomes the sole visible finger",
+    );
+    assert_eq!(
+        kernel_axis(&output, Axis::ABS_MT_TOOL_TYPE)?[1],
+        0,
+        "visible contact must not inherit stale palm classification"
     );
     Ok(())
 }
