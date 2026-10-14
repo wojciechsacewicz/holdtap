@@ -319,7 +319,14 @@ fn run_device(mut source: RawDevice, config: Config) -> io::Result<()> {
                         && (pending == Some(event.value() as u16)
                             || clicked_slot == Some(event.value() as u16))));
             if !hidden_slot_event && !is_tool_count(event) {
-                queue_event(&mut frame, current_slot, event);
+                if event.event_type() == EventType::ABSOLUTE
+                    && event.code() == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0
+                    && event.value() >= 0
+                {
+                    restore_contact(&mut frame, &slots, current_slot);
+                } else {
+                    queue_event(&mut frame, current_slot, event);
+                }
             }
 
             if matches!(decision, Decision::Click(_)) {
